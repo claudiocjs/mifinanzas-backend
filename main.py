@@ -2,7 +2,8 @@ import base64
 import hashlib
 import os
 import secrets
-from typing import Optional
+import time
+from typing import Any, Optional
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import httpx
@@ -18,7 +19,7 @@ APP_NAME = "Mi Finanzas Backend"
 MP_AUTH_URL = "https://auth.mercadopago.com.ar/authorization"
 MP_TOKEN_URL = "https://api.mercadopago.com/oauth/token"
 
-APP_VERSION = "0.2.2-HF2"
+APP_VERSION = "0.3.0"
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
 
@@ -92,6 +93,8 @@ class StatusResponse(BaseModel):
     connected: bool
     redirect_uri: str
     database_configured: bool = False
+    refresh_available: bool = False
+    token_expires_in_seconds: Optional[int] = None
 
 
 def _require_config():
@@ -191,6 +194,13 @@ async def health():
 async def status():
     configured = all([CLIENT_ID, CLIENT_SECRET, BASE_URL, APP_SECRET_KEY, TOKEN_ENCRYPTION_KEY])
     token = await _load_token()
+    expires_left = None
+    if token:
+        obtained = int(token.get("_obtained_at", 0) or 0)
+        expires_in = int(token.get("expires_in", 0) or 0)
+        if obtained > 0 and expires_in > 0:
+            expires_left = max(0, obtained + expires_in - int(time.time()))
+
     return StatusResponse(
         backend="online",
         version=APP_VERSION,
@@ -198,6 +208,8 @@ async def status():
         connected=token is not None,
         redirect_uri=_redirect_uri() if BASE_URL else "",
         database_configured=bool(DATABASE_URL),
+        refresh_available=bool(token and token.get("refresh_token")),
+        token_expires_in_seconds=expires_left,
     )
 
 
@@ -261,8 +273,8 @@ async def callback(
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.post(
             MP_TOKEN_URL,
-            data=payload,
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            json=payload,
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
         )
 
     if r.status_code >= 400:
@@ -291,21 +303,109 @@ async def callback(
     return response
 
 
-async def _current_access_token():
+async def _refresh_oauth_token(token: dict, force: bool = False) -> dict:
+    """
+    Renueva el Access Token usando el refresh_token persistido.
+    Mercado Pago puede devolver un refresh_token nuevo, por eso siempre
+    persistimos la respuesta completa.
+    """
+    expires_in = int(token.get("expires_in", 0) or 0)
+    obtained_at = int(token.get("_obtained_at", 0) or 0)
+    now = int(time.time())
+    expires_soon = (
+        expires_in > 0
+        and obtained_at > 0
+        and now >= (obtained_at + expires_in - 300)
+    )
+
+    if not force and not expires_soon:
+        return token
+
+    refresh_token = token.get("refresh_token")
+    if not refresh_token:
+        if force:
+            raise HTTPException(
+                status_code=409,
+                detail="La autorización no contiene refresh_token. Es necesario volver a vincular Mercado Pago.",
+            )
+        return token
+
+    payload = {
+        "client_secret": CLIENT_SECRET,
+        "client_id": CLIENT_ID,
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+    }
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.post(
+            MP_TOKEN_URL,
+            json=payload,
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+        )
+
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=502,
+            detail=f"No se pudo renovar el token de Mercado Pago (HTTP {response.status_code}).",
+        )
+
+    refreshed = response.json()
+    refreshed["_obtained_at"] = int(time.time())
+
+    # Si MP no rotara alguno de los campos, preservamos el valor anterior.
+    if not refreshed.get("refresh_token") and token.get("refresh_token"):
+        refreshed["refresh_token"] = token["refresh_token"]
+
+    await _save_token(refreshed)
+    return refreshed
+
+
+async def _current_token(force_refresh: bool = False) -> dict:
     token = await _load_token()
     if not token:
         raise HTTPException(status_code=409, detail="Mercado Pago no está vinculado")
-    return token.get("access_token")
+    return await _refresh_oauth_token(token, force=force_refresh)
+
+
+async def _current_access_token(force_refresh: bool = False) -> str:
+    token = await _current_token(force_refresh=force_refresh)
+    access = token.get("access_token")
+    if not access:
+        raise HTTPException(status_code=500, detail="OAuth almacenado sin access_token")
+    return access
+
+
+async def _mp_get(
+    url: str,
+    *,
+    params: Optional[dict[str, Any]] = None,
+) -> httpx.Response:
+    """
+    GET autenticado. Si MP responde 401, fuerza una renovación y reintenta una vez.
+    """
+    access = await _current_access_token()
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.get(
+            url,
+            params=params,
+            headers={"Authorization": f"Bearer {access}", "Accept": "application/json"},
+        )
+
+    if response.status_code == 401:
+        access = await _current_access_token(force_refresh=True)
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.get(
+                url,
+                params=params,
+                headers={"Authorization": f"Bearer {access}", "Accept": "application/json"},
+            )
+    return response
 
 
 @app.get("/api/mercadopago/account", dependencies=[Depends(_apk_auth)])
 async def account():
-    access = await _current_access_token()
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.get(
-            "https://api.mercadolibre.com/users/me",
-            headers={"Authorization": f"Bearer {access}", "accept": "application/json"},
-        )
+    r = await _mp_get("https://api.mercadolibre.com/users/me")
     if r.status_code >= 400:
         raise HTTPException(status_code=502, detail=f"users/me HTTP {r.status_code}")
     d = r.json()
@@ -321,35 +421,135 @@ async def account():
 
 
 @app.get("/api/mercadopago/payments", dependencies=[Depends(_apk_auth)])
-async def payments(limit: int = 20, offset: int = 0):
-    access = await _current_access_token()
+async def payments(limit: int = 20, offset: int = 0, days: int = 30):
     limit = max(1, min(limit, 50))
     offset = max(0, offset)
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.get(
-            "https://api.mercadopago.com/v1/payments/search",
-            params={"limit": limit, "offset": offset, "sort": "date_created", "criteria": "desc"},
-            headers={"Authorization": f"Bearer {access}", "accept": "application/json"},
-        )
+    days = max(1, min(days, 364))
+
+    params = {
+        "limit": limit,
+        "offset": offset,
+        "sort": "date_created",
+        "criteria": "desc",
+        "range": "date_created",
+        "begin_date": f"NOW-{days}DAYS",
+        "end_date": "NOW",
+    }
+
+    r = await _mp_get(
+        "https://api.mercadopago.com/v1/payments/search",
+        params=params,
+    )
+
     if r.status_code >= 400:
-        raise HTTPException(status_code=502, detail=f"Payment Search HTTP {r.status_code}")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Payment Search HTTP {r.status_code}",
+        )
+
     data = r.json()
     return {
+        "source": "payment_search",
+        "window_days": days,
         "paging": data.get("paging", {}),
         "results": [
             {
                 "id": x.get("id"),
                 "date_created": x.get("date_created"),
                 "date_approved": x.get("date_approved"),
+                "date_last_updated": x.get("date_last_updated"),
                 "status": x.get("status"),
+                "status_detail": x.get("status_detail"),
                 "operation_type": x.get("operation_type"),
                 "transaction_amount": x.get("transaction_amount"),
+                "transaction_amount_refunded": x.get("transaction_amount_refunded"),
                 "currency_id": x.get("currency_id"),
                 "description": x.get("description"),
                 "payment_method_id": x.get("payment_method_id"),
                 "payment_type_id": x.get("payment_type_id"),
+                "installments": x.get("installments"),
+                "external_reference": x.get("external_reference"),
             } for x in data.get("results", [])
         ],
+    }
+
+
+@app.get("/api/mercadopago/account-money/config", dependencies=[Depends(_apk_auth)])
+async def account_money_config():
+    """
+    Diagnóstico de disponibilidad del Reporte de Todas las transacciones.
+    Es sólo lectura: no crea ni modifica reportes.
+    """
+    r = await _mp_get(
+        "https://api.mercadopago.com/v1/account/settlement_report/config"
+    )
+
+    if r.status_code == 404:
+        return {
+            "available": False,
+            "configured": False,
+            "http_status": 404,
+            "detail": "La cuenta todavía no tiene configuración del reporte.",
+        }
+
+    if r.status_code >= 400:
+        return {
+            "available": False,
+            "configured": False,
+            "http_status": r.status_code,
+            "detail": "Mercado Pago no habilitó este recurso con la autorización actual.",
+        }
+
+    data = r.json()
+    return {
+        "available": True,
+        "configured": True,
+        "http_status": 200,
+        "scheduled": data.get("scheduled"),
+        "file_name_prefix": data.get("file_name_prefix"),
+        "include_withdraw": data.get("include_withdraw"),
+        "display_timezone": data.get("display_timezone"),
+    }
+
+
+@app.get("/api/mercadopago/capabilities", dependencies=[Depends(_apk_auth)])
+async def capabilities():
+    """
+    Prueba no destructiva: comprueba token/refresh y disponibilidad de las dos
+    fuentes iniciales sin devolver datos financieros sensibles.
+    """
+    payments_r = await _mp_get(
+        "https://api.mercadopago.com/v1/payments/search",
+        params={
+            "limit": 1,
+            "offset": 0,
+            "sort": "date_created",
+            "criteria": "desc",
+            "range": "date_created",
+            "begin_date": "NOW-30DAYS",
+            "end_date": "NOW",
+        },
+    )
+    report_r = await _mp_get(
+        "https://api.mercadopago.com/v1/account/settlement_report/config"
+    )
+
+    token = await _current_token()
+    return {
+        "oauth": {
+            "connected": True,
+            "refresh_available": bool(token.get("refresh_token")),
+            "scope": token.get("scope"),
+        },
+        "payment_search": {
+            "http_status": payments_r.status_code,
+            "available": payments_r.status_code == 200,
+        },
+        "account_money_report": {
+            "http_status": report_r.status_code,
+            "available": report_r.status_code == 200,
+            "configured": report_r.status_code == 200,
+        },
     }
 
 
