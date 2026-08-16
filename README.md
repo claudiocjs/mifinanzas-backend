@@ -1,23 +1,13 @@
-# Mi Finanzas - Backend Mercado Pago V0.1
+# Mi Finanzas Backend V0.2 Durable
 
-Backend FastAPI para validar OAuth + PKCE de Mercado Pago sin guardar secretos en el APK.
+Agrega persistencia cifrada del OAuth en PostgreSQL, alias `/mercadopago/connect`,
+endpoints protegidos para la APK y consulta inicial de cuenta/pagos.
 
-Endpoints:
-- /health
-- /mercadopago/status
-- /mercadopago/login
-- /mercadopago/callback
-- POST /mercadopago/disconnect
+Nuevas variables:
+- DATABASE_URL
+- APK_API_KEY
 
-Variables de entorno:
-- MP_CLIENT_ID
-- MP_CLIENT_SECRET
-- APP_BASE_URL
-- APP_SECRET_KEY
-- TOKEN_ENCRYPTION_KEY
+El APK nunca recibe `MP_CLIENT_SECRET` ni el Access Token OAuth.
 
-Redirect URI:
-https://TU-SERVICIO.onrender.com/mercadopago/callback
-
-V0.1 guarda el token cifrado solo en memoria para validar primero el flujo OAuth.
-La persistencia durable se agrega después de confirmar que la autorización funciona.
+Importante: Payment Search devuelve pagos; no representa necesariamente toda la
+actividad de la billetera. El Account Money Report queda para la siguiente fase.
