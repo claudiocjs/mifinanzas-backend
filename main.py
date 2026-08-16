@@ -17,7 +17,9 @@ APP_NAME = "Mi Finanzas Backend"
 MP_AUTH_URL = "https://auth.mercadopago.com.ar/authorization"
 MP_TOKEN_URL = "https://api.mercadopago.com/oauth/token"
 
-app = FastAPI(title=APP_NAME, version="0.1.0")
+APP_VERSION = "0.2.1-HF1"
+
+app = FastAPI(title=APP_NAME, version=APP_VERSION)
 
 CLIENT_ID = os.getenv("MP_CLIENT_ID", "").strip()
 CLIENT_SECRET = os.getenv("MP_CLIENT_SECRET", "").strip()
@@ -55,6 +57,7 @@ _encrypted_token: Optional[bytes] = None
 
 class StatusResponse(BaseModel):
     backend: str
+    version: str
     mercado_pago_configured: bool
     connected: bool
     redirect_uri: str
@@ -146,12 +149,12 @@ async def startup():
 
 @app.get("/")
 async def root():
-    return {"name": APP_NAME, "status": "ok"}
+    return {"name": APP_NAME, "version": APP_VERSION, "status": "ok"}
 
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {"status": "ok", "version": APP_VERSION}
 
 
 @app.get("/mercadopago/status", response_model=StatusResponse)
@@ -160,6 +163,7 @@ async def status():
     token = await _load_token()
     return StatusResponse(
         backend="online",
+        version=APP_VERSION,
         mercado_pago_configured=configured,
         connected=token is not None,
         redirect_uri=_redirect_uri() if BASE_URL else "",
