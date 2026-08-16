@@ -3,6 +3,7 @@ import hashlib
 import os
 import secrets
 from typing import Optional
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import httpx
 from cryptography.fernet import Fernet
@@ -17,7 +18,7 @@ APP_NAME = "Mi Finanzas Backend"
 MP_AUTH_URL = "https://auth.mercadopago.com.ar/authorization"
 MP_TOKEN_URL = "https://api.mercadopago.com/oauth/token"
 
-APP_VERSION = "0.2.1-HF1"
+APP_VERSION = "0.2.2-HF2"
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
 
@@ -31,11 +32,36 @@ APK_API_KEY = os.getenv("APK_API_KEY", "").strip()
 
 
 def _db_url():
-    if DATABASE_URL.startswith("postgresql://"):
-        return DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
-    if DATABASE_URL.startswith("postgres://"):
-        return DATABASE_URL.replace("postgres://", "postgresql+asyncpg://", 1)
-    return DATABASE_URL
+    """
+    Normaliza la URL de Neon para SQLAlchemy + asyncpg.
+
+    Neon entrega normalmente ?sslmode=require&channel_binding=require.
+    SQLAlchemy convierte la URL a argumentos DBAPI y asyncpg no acepta
+    'sslmode'/'channel_binding' como kwargs directos. Se eliminan de la URL
+    y SSL se exige mediante connect_args={"ssl": "require"}.
+    """
+    if not DATABASE_URL:
+        return ""
+
+    url = DATABASE_URL
+    if url.startswith("postgresql://"):
+        url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
+    elif url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql+asyncpg://", 1)
+
+    parts = urlsplit(url)
+    filtered_query = [
+        (k, v)
+        for (k, v) in parse_qsl(parts.query, keep_blank_values=True)
+        if k.lower() not in {"sslmode", "channel_binding"}
+    ]
+    return urlunsplit((
+        parts.scheme,
+        parts.netloc,
+        parts.path,
+        urlencode(filtered_query),
+        parts.fragment,
+    ))
 
 
 class Base(DeclarativeBase):
@@ -49,7 +75,11 @@ class SecretState(Base):
     updated_at_epoch: Mapped[int] = mapped_column(BigInteger, nullable=False)
 
 
-engine = create_async_engine(_db_url(), pool_pre_ping=True) if _db_url() else None
+engine = create_async_engine(
+    _db_url(),
+    pool_pre_ping=True,
+    connect_args={"ssl": "require"},
+) if _db_url() else None
 SessionLocal = async_sessionmaker(engine, expire_on_commit=False) if engine else None
 
 _encrypted_token: Optional[bytes] = None
