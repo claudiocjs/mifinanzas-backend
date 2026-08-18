@@ -181,3 +181,12 @@ async def bootstrap_analysis_v052():
             "auto_import_enabled": False,
         },
     }
+
+
+# Compatibility shim: Render services that still have `uvicorn v052:app`
+# configured in the dashboard will transparently load V0.5.3 after this
+# module is fully initialized. If v053 is already importing v052, avoid a
+# circular re-import.
+import sys
+if "v053" not in sys.modules:
+    import v053 as _v053  # noqa: F401,E402
