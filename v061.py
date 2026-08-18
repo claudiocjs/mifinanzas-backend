@@ -106,6 +106,7 @@ def _generic_transfer_item(group: dict[str, Any], payment: dict[str, Any] | None
         "classification_required": True,
         "allowed_purposes": [
             "PAYMENT_SERVICE_PRODUCT_MERCHANT",
+            "OWN_PAYMENT_FUNDING",
             "OWN_ACCOUNT_TRANSFER",
             "INVESTMENT_SAVINGS",
             "LOAN_TO_THIRD_PARTY",
