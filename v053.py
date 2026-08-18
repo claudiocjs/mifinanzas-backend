@@ -198,3 +198,10 @@ async def bootstrap_analysis_v053():
             "reason": "diagnostic normalization stage before Android sync",
         },
     }
+
+
+# Compatibility shim: services still starting with v052 eventually import v053.
+# From here, chain to V0.5.4 after V0.5.3 is fully initialized.
+import sys
+if "v054" not in sys.modules:
+    import v054 as _v054  # noqa: F401,E402
